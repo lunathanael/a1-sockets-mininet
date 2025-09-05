@@ -3,8 +3,18 @@
 #include <netinet/in.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <chrono>
+#include <optional>
 
-void severRunner(int port) {
+void ack(int sockfd) {
+    char message[] = "\x06";
+    if (send(sockfd, message, sizeof(message), 0) == -1) {
+        spdlog::error("send serror");
+        exit(1);
+    }
+}
+
+void runServer(int port) {
     int sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sockfd == -1)  {
         spdlog::error("error making socket");
@@ -47,21 +57,47 @@ void severRunner(int port) {
     // char s[INET6_ADDRSTRLEN];
     // spdlog::debug("connetion from %s\n", inet_ntoa(connection.sin_addr));
 
-    // // Receive message
-    // char buf[1024];
-    // int ret {};
-    // if ((ret = recv(connectionfd, buf, sizeof(buf), 0)) == -1) {
-    //     perror("recv");
-    //     close(connectionfd);
-    //     continue;
-    // }
-    // buf[ret] = '\0';
+    // Initial Recv
+    std::optional<decltype(std::chrono::steady_clock::now())> prev;
+    decltype(std::chrono::steady_clock::now()-std::chrono::steady_clock::now()) total{0};
+    {
+        char buf[1024];
+        int ret {};
+        for(int i = 0; i < 8; ++i) {
+            if ((ret = recv(connectionfd, buf, sizeof(buf), 0)) == -1) {
+                spdlog::error("recv");
+                close(connectionfd);
+                return;
+            }
+            if(prev.has_value()) {
+                total += std::chrono::steady_clock::now() - prev.value();
+            }
+            ack(sockfd);
+            prev = std::chrono::steady_clock::now();
+        }
+    }
+    std::chrono::duration propagation_delay = total / 7;
+    int bytes_sent{0};
+    total = total.zero();
 
-    // printf("message: %s\n", buf);
+    // Receive messages
+    {
+        char buf[81920];
+        int ret {};
+
+        while ((ret = recv(connectionfd, buf, sizeof(buf), 0)) != -1) {
+            total += std::chrono::steady_clock::now() - prev.value() - propagation_delay;
+            bytes_sent += ret;
+            ack(sockfd);
+            prev = std::chrono::steady_clock::now();
+        }
+    }
 
 
     close(connectionfd);
     close(sockfd);
+
+    spdlog::info("Received={} KB, Rate={:.3f} Mbps, RTT={} ms", bytes_sent, static_cast<double>(bytes_sent) / std::chrono::duration_cast<std::chrono::seconds>(total).count(), std::chrono::duration_cast<std::chrono::milliseconds>(propagation_delay).count());
 }
 
 int main(int argc, char** argv) {
@@ -85,7 +121,7 @@ int main(int argc, char** argv) {
 
     
     if(is_server) {
-
+        runServer(port);
     }
     else {
 
