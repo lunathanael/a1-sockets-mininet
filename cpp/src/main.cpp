@@ -7,7 +7,9 @@
 #include <chrono>
 #include <optional>
 #include <string>
-#include <iostream>
+#include <ratio>
+
+using hrc = std::chrono::high_resolution_clock;
 
 int ack(int connectionfd) {
     char message[1] = {'A'};
@@ -54,20 +56,24 @@ void runServer(int port) {
     spdlog::info("Client connected");
 
     // Initial Recv
-    auto prev = std::chrono::steady_clock::now();
-    int total{0};
+    auto prev = hrc::now();
+    std::chrono::nanoseconds total{};
     {
         char buf[1];
         int ret {};
         for(int i = 0; i < 8; ++i) {
-            if ((ret = recv(connectionfd, buf, sizeof(buf), 0)) == -1) {
-                spdlog::error("recv");
-                close(connectionfd);
-                close(sockfd);
-                exit(1);
+            int loc{0};
+            while(loc < sizeof(buf)) {
+                if ((ret = recv(connectionfd, buf, sizeof(buf), 0)) == -1) {
+                    spdlog::error("recv");
+                    close(connectionfd);
+                    close(sockfd);
+                    exit(1);
+                }
+                loc += ret;
             }
             if(i >= 4) {
-                total += (std::chrono::steady_clock::now() - prev).count();
+                total += hrc::now() - prev;
             }
             if(ack(connectionfd) == -1) {
                 spdlog::error("send");
@@ -75,34 +81,52 @@ void runServer(int port) {
                 close(sockfd);
                 exit(1);
             }
-            prev = std::chrono::steady_clock::now();
+            prev = hrc::now();
         }
     }
-    int rtt = total / 4;
-    total = 0;
-    int bytes_received{0};
+    auto rtt = std::chrono::nanoseconds(total.count() / 4);
+    long long bytes_received{0};
 
     // Receive messages
     {
         char buf[80 * 1000];
         int ret {};
 
-        while ((ret = recv(connectionfd, buf, sizeof(buf), 0)) != -1) {
-            total += (std::chrono::steady_clock::now() - prev).count() - rtt;
-            bytes_received += ret;
-            ack(connectionfd);
-            prev = std::chrono::steady_clock::now();
+        auto start = hrc::now();
+        int cnt{0};
+
+        while (true) {
+            int loc{0};
+            while(loc < sizeof(buf)) {
+                if((ret = recv(connectionfd, buf + loc, sizeof(buf) - loc, 0)) == -1) {
+                    break;
+                }
+                if(ret == 0)
+                    break;
+                loc += ret;
+            }
+            if(loc == 0)
+                break;
+            ++cnt;
+            bytes_received += loc;
+
+            if(ack(connectionfd) == -1) {
+                break;
+            }
         }
+
+        total = (hrc::now() - start) - (rtt * cnt);
     }
 
     close(connectionfd);
     close(sockfd);
 
     double mb_sent = static_cast<double>(bytes_received) / (1000.0 * 1000.0);
-    double seconds = static_cast<double>(total) / 1'000'000'000.0;
+    double seconds = std::chrono::duration<double>(total).count();
     double mbps = (seconds > 0) ? (mb_sent * 8.0 / seconds) : 0.0;
+    int rtt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(rtt).count();
     
-    spdlog::info("Sent={} KB, Rate={:.3f} Mbps, RTT={} ms", bytes_received / 1000, mbps, rtt / 1'000'000);
+    spdlog::info("Sent={} KB, Rate={:.3f} Mbps, RTT={} ms", bytes_received / 1000, mbps, rtt_ms);
 }
 
 void runClient(std::string& hostname, int port, double time) {
@@ -130,67 +154,82 @@ void runClient(std::string& hostname, int port, double time) {
         exit(1);
     }
 
-    auto start = std::chrono::steady_clock::now();
-    int total = 0;
+    auto start = hrc::now();
+    std::chrono::nanoseconds total{};
     {
         char buf[1];
         char message[1] = {'M'};
         for(int i = 0; i < 8; ++i) {
-            start = std::chrono::steady_clock::now();
             if ((send(sockfd, message, sizeof(message), 0)) == -1) {
                 spdlog::error("send");
                 close(sockfd);
                 return;
             }
+            start = hrc::now();
 
-            if (recv(sockfd, buf, sizeof(buf), 0) == -1) {
-                spdlog::error("recv");
-                close(sockfd);
-                return;
+            int loc{0};
+            while(loc < 1) {
+                int res = recv(sockfd, buf, sizeof(buf), 0);
+                if (res == -1) {
+                    spdlog::error("recv");
+                    close(sockfd);
+                    exit(1);
+                }
+                loc += res;
             }
             
             if(i >= 4) {
-                total += (std::chrono::steady_clock::now() - start).count();
+                total += (hrc::now() - start);
             }
         }
     }
 
-    int rtt = total / 4;
-    total = 0;
-    int bytes_sent = 0;
+    auto rtt = std::chrono::nanoseconds(total.count() / 4);
+    long long bytes_sent{0};
 
     {
         char message[80 * 1000] = {0};
         char buf[1];
         int result{};
-        auto curr = std::chrono::steady_clock::now();
-        while(std::chrono::steady_clock::now() < curr + std::chrono::duration<double>(time)) {
-            start = std::chrono::steady_clock::now();
+
+        int cnt{0};
+        start = hrc::now();
+
+        while((hrc::now() - start) < std::chrono::duration<double>(time)) {
             if ((result = send(sockfd, message, sizeof(message), 0)) == -1) {
                 spdlog::error("send");
                 close(sockfd);
                 exit(1);
             }
 
-            if (recv(sockfd, buf, sizeof(buf), 0) == -1) {
-                spdlog::error("recv");
-                close(sockfd);
-                exit(1);
+
+            int loc{0};
+            while(loc < 1) {
+                int res = recv(sockfd, buf, sizeof(buf), 0);
+                if (res == -1) {
+                    spdlog::error("recv");
+                    close(sockfd);
+                    exit(1);
+                }
+                loc += res;
             }
 
-            total += (std::chrono::steady_clock::now() - start).count() - rtt;
             bytes_sent += result;
+            ++cnt;
         }
+
+        total = (hrc::now() - start) - (rtt * cnt);
     }
 
     close(sockfd);
     shutdown(sockfd, SHUT_RDWR);
 
     double mb_sent = static_cast<double>(bytes_sent) / (1000.0 * 1000.0);
-    double seconds = static_cast<double>(total) / 1'000'000'000.0;
+    double seconds = std::chrono::duration<double>(total).count();
     double mbps = (seconds > 0) ? (mb_sent * 8.0 / seconds) : 0.0;
-
-    spdlog::info("Sent={} KB, Rate={:.3f} Mbps, RTT={} ms", bytes_sent / 1000, mbps, rtt / 1'000'000);
+    int rtt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(rtt).count();
+    
+    spdlog::info("Sent={} KB, Rate={:.3f} Mbps, RTT={} ms", bytes_sent / 1000, mbps, rtt_ms);
 }
 
 int main(int argc, char** argv) {
@@ -224,6 +263,7 @@ int main(int argc, char** argv) {
 
     
     if(is_server) {
+        spdlog::info("Running server with options, port: {}", port);
         runServer(port);
     }
     else {
@@ -233,6 +273,7 @@ int main(int argc, char** argv) {
             spdlog::error("Error: time argument must be greater than 0");
             return -1;
         }
+        spdlog::info("Running Client with options, port: {} hostname: {}, time: {}", port, hostname, time);
         runClient(hostname, port, time);
     }
     return 0;
